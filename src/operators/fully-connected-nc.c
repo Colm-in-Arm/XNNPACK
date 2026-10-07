@@ -28,6 +28,7 @@
 #include "src/xnnpack/compute.h"
 #include "src/xnnpack/config-types.h"
 #include "src/xnnpack/config.h"
+#include "src/xnnpack/gemm.h"
 #include "src/xnnpack/internal.h"
 #include "src/xnnpack/log.h"
 #include "src/xnnpack/math.h"
@@ -43,6 +44,27 @@
 #include "src/xnnpack/pack.h"
 #include "src/xnnpack/params.h"
 #include <pthreadpool.h>
+
+#if XNN_ARCH_ARM64 && XNN_ENABLE_KLEIDIAI && XNN_ENABLE_ARM_SME2
+static bool xnn_f32_hybrid_runtime_enabled(void) {
+  const char* value = getenv("XNN_ENABLE_F32_HYBRID");
+  return value != NULL && strcmp(value, "1") == 0;
+}
+
+static size_t xnn_f32_hybrid_sme_threads(size_t num_threads) {
+  const char* value = getenv("XNN_F32_HYBRID_SME_THREADS");
+  if (value == NULL) {
+    return 1;
+  }
+
+  char* end = NULL;
+  const unsigned long parsed = strtoul(value, &end, 10);
+  if (end == value || *end != '\0' || parsed == 0) {
+    return 1;
+  }
+  return min((size_t)parsed, num_threads);
+}
+#endif
 
 static float clamp(const float value, const float minimum,
                    const float maximum) {
@@ -3447,6 +3469,32 @@ reshape_fully_connected_nc_with_pack_lh_config(
       break;
   }
 
+  bool f32_hybrid = false;
+  size_t f32_hybrid_sme_threads = 0;
+  size_t f32_hybrid_n_step = 0;
+  xnn_f32_gemm_minmax_ukernel_fn f32_hybrid_neon_ukernel = NULL;
+#if XNN_ARCH_ARM64 && XNN_ENABLE_KLEIDIAI && XNN_ENABLE_ARM_SME2
+  if (fully_connected_op->type == xnn_operator_type_fully_connected_nc_pf32 &&
+      fully_connected_op->gemm_config->arch == xnn_arch_arm_sme2 &&
+      inline_lhs_packing && batch_size >= 128 && num_threads > 1 &&
+      xnn_f32_hybrid_runtime_enabled()) {
+    f32_hybrid_n_step =
+        xnn_pf32_gemm_minmax_ukernel_32x32__neonsme2_get_hybrid_n_step(
+            input_channels);
+    if (f32_hybrid_n_step != 0) {
+      f32_hybrid_sme_threads = xnn_f32_hybrid_sme_threads(num_threads);
+      if (f32_hybrid_sme_threads < num_threads) {
+        f32_hybrid = true;
+        f32_hybrid_neon_ukernel = xnn_f32_gemm_minmax_ukernel_6x16__kai_neon;
+        xnn_log_debug(
+            "Enabling F32 hybrid GEMM with %zu SME workers and %zu NEON "
+            "workers.",
+            f32_hybrid_sme_threads, num_threads - f32_hybrid_sme_threads);
+      }
+    }
+  }
+#endif
+
   // Clear the operator's compute data to avoid accidentally reusing values from
   // a previous reshape (this was an interesting bug to track down).
   memset(fully_connected_op->compute, 0, 2 * sizeof(struct compute_parameters));
@@ -3467,13 +3515,19 @@ reshape_fully_connected_nc_with_pack_lh_config(
         xnn_operator_type_to_string_v2(fully_connected_op));
     return xnn_status_out_of_memory;
   }
-  const size_t nc = xnn_gemm_best_tile_size(
+  size_t nc = xnn_gemm_best_tile_size(
       /*num_groups=*/1, /*m=*/batch_size, /*n=*/output_channels,
       /*m_stride=*/m_stride,
       /*n_stride=*/
       fully_connected_op->weights_stride,
       /*cn_stride=*/1 << log2_output_element_size, mr, nr,
       /*num_threads=*/num_threads);
+  if (f32_hybrid) {
+    // Extra chunks let faster workers claim more work from the dynamic queue.
+    const size_t target_chunks = num_threads * 4;
+    nc = round_up(divide_round_up(output_channels, target_chunks),
+                  f32_hybrid_n_step);
+  }
 
   // If we are packing the LHS, provide a per-thread workspace to do so inline.
   if (packed_lh_config) {
@@ -3504,17 +3558,18 @@ reshape_fully_connected_nc_with_pack_lh_config(
             "it is a no-op for GEMV.",
             xnn_operator_type_to_string(fully_connected_op->type), batch_size,
             output_channels, input_channels);
-      } else if (!should_inline_lhs_packing ||
+      } else if (f32_hybrid || !should_inline_lhs_packing ||
                  num_threads * mr > round_up(batch_size, mr)) {
         xnn_log_debug(
             "Pre-packing LHS of %s with m=%zu, n=%zu, and k=%zu despite "
             "request to inline because %s.",
             xnn_operator_type_to_string(fully_connected_op->type), batch_size,
             output_channels, input_channels,
-            !should_inline_lhs_packing
+            f32_hybrid ? "hybrid GEMM requires a shared packed lhs"
+            : !should_inline_lhs_packing
                 ? "packed lhs will likely not stay in cache"
-                : "batch size does not parallelize well over the number of "
-                  "threads");
+                : "batch size does not parallelize well over the number "
+                  "of threads");
 
         // Allocate a workspace for the entire LHS.
         *workspace_size = packed_lh_config->size_fn(
@@ -3523,7 +3578,7 @@ reshape_fully_connected_nc_with_pack_lh_config(
         // Set up the LHS packing as a separate compute.
         size_t lhs_stride;
         if (!xnn_safe_mul(
-                input_channels,
+                fully_connected_op->input_pixel_stride,
                 (size_t)1 << packed_lh_config->log2_input_element_size,
                 &lhs_stride)) {
           xnn_log_error(
@@ -3549,7 +3604,11 @@ reshape_fully_connected_nc_with_pack_lh_config(
             (pthreadpool_task_2d_tile_1d_dynamic_t)xnn_compute_pack_lh;
         fully_connected_op->compute[0].range[0] = 1;
         fully_connected_op->compute[0].range[1] = batch_size;
-        fully_connected_op->compute[0].tile[0] = mr_packed;
+        fully_connected_op->compute[0].tile[0] =
+            f32_hybrid
+                ? round_up(divide_round_up(batch_size, f32_hybrid_sme_threads),
+                           mr_packed)
+                : mr_packed;
 
         fully_connected_op->num_compute_invocations = 2;
         gemm_compute = &fully_connected_op->compute[1];
@@ -3635,6 +3694,8 @@ reshape_fully_connected_nc_with_pack_lh_config(
       .cn_stride = nr << log2_output_element_size,
       .log2_csize = log2_output_element_size,
       .ukernel = gemm_ukernel,
+      .f32_hybrid_neon_ukernel = f32_hybrid_neon_ukernel,
+      .f32_hybrid_sme_threads = f32_hybrid_sme_threads,
       .mr = mr,
       .nc = output_channels,
       .kr = kr,
@@ -3657,6 +3718,13 @@ reshape_fully_connected_nc_with_pack_lh_config(
   memcpy(&gemm_context->gemm.params, params, params_size);
   gemm_context->gemm.fused_params = &gemm_context->gemm.params;
 
+  if (f32_hybrid) {
+    gemm_compute->type =
+        xnn_parallelization_type_2d_tile_2d_dynamic_with_thread;
+    gemm_compute->task_2d_tile_2d_dynamic_with_id =
+        (pthreadpool_task_2d_tile_2d_dynamic_with_id_t)
+            xnn_compute_f32_hybrid_gemm;
+  } else {
 #if XNN_MAX_UARCH_TYPES > 1
   if (xnn_is_hmp_gemm_ukernel(gemm_ukernel)) {
     if (packed_lh_config) {
@@ -3711,6 +3779,7 @@ reshape_fully_connected_nc_with_pack_lh_config(
             (pthreadpool_task_2d_tile_2d_dynamic_t)xnn_compute_gemm;
       }
     }
+  }
 
   if (packed_lh_config && inline_lhs_packing) {
     gemm_compute->range[0] = batch_size;
@@ -4277,6 +4346,9 @@ static enum xnn_status setup_fully_connected_nc(
   } else {
     gemm_context->gemm.a = input;
     gemm_context->gemm.workspace = workspace;
+  }
+  if (gemm_context->gemm.f32_hybrid_neon_ukernel != NULL) {
+    gemm_context->gemm.a_unpacked = input;
   }
   gemm_context->gemm.c = output;
   gemm_context->gemm.quantization_params = quantization_params;

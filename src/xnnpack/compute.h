@@ -317,6 +317,8 @@ struct gemm_context {
   size_t k_scaled;
   // Input matrix A.
   const void* a;
+  // Unpacked input matrix A for PF32 hybrid GEMM.
+  const void* a_unpacked;
   // Stride, in bytes, between each row (M) of A.
   size_t a_stride;
   // Stride, in bytes, between each group (G) of A.
@@ -368,6 +370,8 @@ struct gemm_context {
     struct xnn_hmp_dqgemm_qc2w_ukernel dq_qc2w_ukernel;
     struct xnn_hmp_qp8gemm_ukernel qp8_ukernel;
   };
+  xnn_f32_gemm_minmax_ukernel_fn f32_hybrid_neon_ukernel;
+  size_t f32_hybrid_sme_threads;
   // Parameters for dynamically quantized inputs.
   const struct xnn_qd8_quantization_params* quantization_params;
   const float* row_sum;
@@ -436,6 +440,10 @@ XNN_PRIVATE void xnn_compute_hmp_grouped_inline_packed_qp8gemm(
 
 XNN_PRIVATE void xnn_compute_hmp_gemm(
     struct gemm_context* context, uint32_t uarch_index, size_t nr_block_start,
+    size_t mr_block_start, size_t nr_block_size, size_t mr_block_size);
+
+XNN_PRIVATE void xnn_compute_f32_hybrid_gemm(
+    struct gemm_context* context, uint32_t thread_id, size_t nr_block_start,
     size_t mr_block_start, size_t nr_block_size, size_t mr_block_size);
 
 XNN_PRIVATE void xnn_compute_hmp_dqgemm(

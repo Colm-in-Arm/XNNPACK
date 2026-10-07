@@ -22,6 +22,12 @@
 #include "src/xnnpack/internal.h"
 #include "src/xnnpack/isa-checks.h"
 #include "src/xnnpack/math.h"
+#include <pthreadpool.h>
+
+#include <cstdlib>
+#include <cstring>
+
+#include "src/xnnpack/operator.h"
 #include "test/operators/fully-connected-operator-tester.h"
 
 TEST(FULLY_CONNECTED_NC_QS8, unit_batch) {
@@ -1050,6 +1056,94 @@ TEST(FULLY_CONNECTED_NC_F32, weights_cache_unit_batch_transpose_weights) {
       .use_weights_cache(true)
       .TestF32();
 }
+
+#if XNN_ARCH_ARM64 && XNN_ENABLE_KLEIDIAI && XNN_ENABLE_ARM_SME2
+TEST(FULLY_CONNECTED_NC_PF32, hybrid_sme2_neon) {
+  const char* hybrid_enabled = getenv("XNN_ENABLE_F32_HYBRID");
+  if (hybrid_enabled == nullptr || strcmp(hybrid_enabled, "1") != 0) {
+    GTEST_SKIP();
+  }
+
+  constexpr size_t batch_size = 131;
+  constexpr size_t input_channels = 37;
+  constexpr size_t output_channels = 257;
+  constexpr size_t input_stride = 43;
+  constexpr size_t output_stride = 263;
+  constexpr float output_min = -10.0f;
+  constexpr float output_max = 10.0f;
+
+  xnnpack::ReplicableRandomDevice rng;
+  std::uniform_real_distribution<float> f32dist(-1.0f, 1.0f);
+  xnnpack::Buffer<float> input((batch_size - 1) * input_stride + input_channels,
+                               xnnpack::XnnExtraBytes);
+  xnnpack::Buffer<float> kernel(output_channels * input_channels);
+  xnnpack::Buffer<float> bias(output_channels);
+  xnnpack::Buffer<float> output((batch_size - 1) * output_stride +
+                                output_channels);
+  xnnpack::Buffer<float> output_ref(batch_size * output_channels);
+  std::generate(input.begin(), input.end(), [&]() { return f32dist(rng); });
+  std::generate(kernel.begin(), kernel.end(), [&]() { return f32dist(rng); });
+  std::generate(bias.begin(), bias.end(), [&]() { return f32dist(rng); });
+
+  for (size_t m = 0; m < batch_size; m++) {
+    for (size_t n = 0; n < output_channels; n++) {
+      float acc = bias[n];
+      for (size_t k = 0; k < input_channels; k++) {
+        acc += input[m * input_stride + k] * kernel[n * input_channels + k];
+      }
+      output_ref[m * output_channels + n] =
+          std::max(std::min(acc, output_max), output_min);
+    }
+  }
+
+  ASSERT_EQ(xnn_status_success, xnn_initialize(nullptr));
+  xnn_operator_t fully_connected_op = nullptr;
+  const enum xnn_status status = xnn_create_fully_connected_nc_pf32(
+      input_channels, output_channels, input_stride, output_stride,
+      kernel.data(), bias.data(), output_min, output_max,
+      XNN_FLAG_INLINE_LHS_PACKING, nullptr, &fully_connected_op);
+  if (status == xnn_status_unsupported_hardware) {
+    GTEST_SKIP();
+  }
+  ASSERT_EQ(xnn_status_success, status);
+  std::unique_ptr<xnn_operator, decltype(&xnn_delete_operator)>
+      auto_fully_connected_op(fully_connected_op, xnn_delete_operator);
+
+  if (fully_connected_op->gemm_config->arch != xnn_arch_arm_sme2) {
+    GTEST_SKIP();
+  }
+
+  std::unique_ptr<pthreadpool, decltype(&pthreadpool_destroy)> auto_threadpool(
+      pthreadpool_create(4), pthreadpool_destroy);
+  ASSERT_NE(nullptr, auto_threadpool.get());
+  size_t workspace_size = 0;
+  ASSERT_EQ(xnn_status_success, xnn_reshape_fully_connected_nc_pf32(
+                                    fully_connected_op, batch_size,
+                                    &workspace_size, auto_threadpool.get()));
+  ASSERT_EQ(2, fully_connected_op->num_compute_invocations);
+  ASSERT_NE(
+      nullptr,
+      fully_connected_op->dynamic_context.gemm->gemm.f32_hybrid_neon_ukernel);
+  ASSERT_EQ(xnn_parallelization_type_2d_tile_2d_dynamic_with_thread,
+            fully_connected_op->compute[1].type);
+
+  xnnpack::Buffer<uint8_t, XNN_ALLOCATION_ALIGNMENT> workspace(workspace_size);
+  ASSERT_EQ(xnn_status_success,
+            xnn_setup_fully_connected_nc_pf32(fully_connected_op, input.data(),
+                                              output.data(), workspace.data()));
+  ASSERT_EQ(xnn_status_success,
+            xnn_run_operator(fully_connected_op, auto_threadpool.get()));
+
+  for (size_t m = 0; m < batch_size; m++) {
+    for (size_t n = 0; n < output_channels; n++) {
+      const float expected = output_ref[m * output_channels + n];
+      ASSERT_NEAR(expected, output[m * output_stride + n],
+                  std::max(1.0e-4f * std::abs(expected), 1.0e-4f))
+          << "at " << m << ", " << n;
+    }
+  }
+}
+#endif
 
 TEST(FULLY_CONNECTED_NC_F32_QC4W, unit_batch) {
   FullyConnectedOperatorTester()

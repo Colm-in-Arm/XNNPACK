@@ -361,6 +361,7 @@ size_t xnn_pf32_gemm_minmax_ukernel_1x32c2__neonsme2_get_mr();
 size_t xnn_pf32_gemm_minmax_ukernel_1x32c2__neonsme2_get_nr();
 size_t xnn_pf32_gemm_minmax_ukernel_32x32c2__neonsme2_get_mr();
 size_t xnn_pf32_gemm_minmax_ukernel_32x32c2__neonsme2_get_nr();
+size_t xnn_pf32_gemm_minmax_ukernel_32x32__neonsme2_get_hybrid_n_step(size_t k);
 
 #define DECLARE_PF32_GEMM_MINMAX_UKERNEL_FUNCTION(fn_name)                  \
                                                                             \
@@ -380,6 +381,11 @@ DECLARE_PF32_GEMM_MINMAX_UKERNEL_FUNCTION(
     xnn_pf32_gemm_minmax_ukernel_1x32__neonsme)
 DECLARE_PF32_GEMM_MINMAX_UKERNEL_FUNCTION(
     xnn_pf32_gemm_minmax_ukernel_32x32__neonsme)
+
+XNN_INTERNAL void xnn_f32_gemm_minmax_ukernel_6x16__kai_neon(
+    size_t mr, size_t nc, size_t kc, const float* a, size_t a_stride,
+    const float* w, float* c, size_t cm_stride, size_t cn_stride,
+    const struct xnn_f32_minmax_params* params);
 
 #define DECLARE_PF32_IGEMM_MINMAX_UKERNEL_FUNCTION(fn_name)                 \
                                                                             \

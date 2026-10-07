@@ -625,6 +625,40 @@ void xnn_compute_qp8gemm(struct gemm_context* restrict context,
                       mr_block_start, nr_block_size, mr_block_size);
 }
 
+XNN_NO_SANITIZE_FUNCTION void xnn_compute_f32_hybrid_gemm(
+    struct gemm_context* restrict context, uint32_t thread_id,
+    size_t nr_block_start, size_t mr_block_start, size_t nr_block_size,
+    size_t mr_block_size) {
+  assert(context->a_unpacked != NULL);
+  assert(context->f32_hybrid_neon_ukernel != NULL);
+  assert(context->f32_hybrid_sme_threads != 0);
+  const bool use_sme2 = thread_id < context->f32_hybrid_sme_threads;
+  xnn_log_debug(
+      "F32 hybrid GEMM worker %zu running %s: m=%zu+%zu, n=%zu+%zu, "
+      "output elements=%zu",
+      (size_t)thread_id, use_sme2 ? "SME2" : "NEON", mr_block_start,
+      mr_block_size, nr_block_start, nr_block_size,
+      mr_block_size * nr_block_size);
+
+  if (use_sme2) {
+    compute_hmp_qp8gemm(context, XNN_UARCH_DEFAULT, nr_block_start,
+                        mr_block_start, nr_block_size, mr_block_size);
+    return;
+  }
+
+  context->f32_hybrid_neon_ukernel(
+      mr_block_size, nr_block_size, context->k_scaled,
+      (const float*)((uintptr_t)context->a_unpacked +
+                     mr_block_start * context->a_stride),
+      context->a_stride,
+      (const float*)((uintptr_t)context->packed_w +
+                     nr_block_start * context->w_stride),
+      (float*)((uintptr_t)context->c + mr_block_start * context->cm_stride +
+               (nr_block_start << context->log2_csize)),
+      context->cm_stride, sizeof(float),
+      (const struct xnn_f32_minmax_params*)context->fused_params);
+}
+
 XNN_NO_SANITIZE_FUNCTION void xnn_compute_spmm(
     struct spmm_context* restrict context, size_t batch_index,
     size_t mr_block_start, size_t mr_block_size) {
